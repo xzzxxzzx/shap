@@ -16,14 +16,13 @@ log = logging.getLogger('shap')
 
 
 def kmeans(X, k, round_values=True):
-    """
-    Summarize a dataset with k mean samples weighted by the number of
-    data points they each represent.
+    """ Summarize a dataset with k mean samples weighted by the number of data points they
+    each represent.
 
     Parameters
     ----------
     X : numpy.array or pandas.DataFrame
-        Matrix of data samples to summarise (# samples x # features)
+        Matrix of data samples to summarize (# samples x # features)
 
     k : int
         Number of means to use for approximation.
@@ -40,7 +39,7 @@ def kmeans(X, k, round_values=True):
     group_names = [str(i) for i in range(X.shape[1])]
     if str(type(X)).endswith("'pandas.core.frame.DataFrame'>"):
         group_names = X.columns
-        X = X.as_matrix()
+        X = X.values
     kmeans = KMeans(n_clusters=k, random_state=0).fit(X)
 
     if round_values:
@@ -52,7 +51,40 @@ def kmeans(X, k, round_values=True):
     return DenseData(kmeans.cluster_centers_, group_names, None, 1.0*np.bincount(kmeans.labels_))
 
 
-class KernelExplainer:
+class KernelExplainer(object):
+    """Uses the Kernel SHAP method to explain the output of any function.
+
+    Kernel SHAP is a method that uses a special weighted linear regression
+    to compute the importance of each feature. The computed importance values
+    are Shapley values from game theory and also coefficents from a local linear
+    regression.
+
+
+    Parameters
+    ----------
+    model : function or iml.Model
+        User supplied function that takes a matrix of samples (# samples x # features) and
+        computes a the output of the model for those samples. The output can be a vector
+        (# samples) or a matrix (# samples x # model outputs).
+
+    data : numpy.array or pandas.DataFrame or iml.DenseData
+        The background dataset to use for integrating out features. To determine the impact
+        of a feature, that feature is set to "missing" and the change in the model output
+        is observed. Since most models aren't designed to handle arbitrary missing data at test
+        time, we simulate "missing" by replacing the feature with the values it takes in the
+        background dataset. So if the background dataset is a simple sample of all zeros, then
+        we would approximate a feature being missing by setting it to zero. For small problems
+        this background datset can be the whole training set, but for larger problems consider
+        using a single reference value or using the kmeans function to summarize the dataset.
+
+    link : "identity" or "logit"
+        A generalized linear model link to connect the feature importance values to the model
+        output. Since the feature importance values, phi, sum up to the model output, it often makes
+        sense to connect them to the ouput with a link function where link(outout) = sum(phi).
+        If the model output is a probability then the LogitLink link function makes the feature
+        importance values have log-odds units.
+    """
+
     def __init__(self, model, data, link=IdentityLink(), **kwargs):
 
         # convert incoming inputs to standardized iml objects
@@ -66,6 +98,12 @@ class KernelExplainer:
         assert isinstance(self.data, DenseData), "Shap explainer only supports the DenseData input currently."
         assert not self.data.transposed, "Shap explainer does not support transposed DenseData currently."
 
+        # warn users about large background data sets
+        if len(self.data.weights) > 100:
+            log.warning("Using " + str(len(self.data.weights)) + " background data samples could cause " +
+                        "slower run times. Consider using shap.kmeans(data, K) to summarize the background " +
+                        "as K weighted samples.")
+
         # init our parameters
         self.N = self.data.data.shape[0]
         self.P = self.data.data.shape[1]
@@ -73,16 +111,58 @@ class KernelExplainer:
         self.nsamplesAdded = 0
         self.nsamplesRun = 0
 
+        # find E_x[f(x)]
+        if self.keep_index:
+            model_null = self.model.f(self.data.convert_to_df())
+        else:
+            model_null = self.model.f(self.data.data)
+        if isinstance(model_null, (pd.DataFrame, pd.Series)):
+            model_null = model_null.values
+        self.fnull = np.sum((model_null.T * self.data.weights).T, 0)
+
+        # see if we have a vector output
+        self.vector_out = True
+        if len(self.fnull.shape) == 0:
+            self.vector_out = False
+            self.fnull = np.array([self.fnull])
+            self.D = 1
+        else:
+            self.D = self.fnull.shape[0]
+
     def shap_values(self, X, **kwargs):
+        """ Estimate the SHAP values for a set of samples.
+
+        Parameters
+        ----------
+        X : numpy.array or pandas.DataFrame
+            A matrix of samples (# samples x # features) on which to explain the model's output.
+
+        nsamples : "auto" or int
+            Number of times to re-evaluate the model when explaining each prediction. More samples
+            lead to lower variance estimates of the SHAP values.
+
+        l1_reg : "auto" or float
+            The l1 regularization to use for feature selection (the estimation procedure is based on
+            a debiased lasso). Set this to zero to remove the feature selection step before estimation.
+
+        Returns
+        -------
+        For a models with a single output this returns a matrix of SHAP values
+        (# samples x # features + 1). The last column is the base value of the model, which is
+        the expected value of the model applied to the background dataset. This causes each row to
+        sum to the model output for that sample. For models with vector outputs this returns a list
+        of such matrices, one for each output.
+        """
+
         # convert dataframes
         if str(type(X)).endswith("pandas.core.series.Series'>"):
-            X = X.as_matrix()
+            X = X.values
         elif str(type(X)).endswith("'pandas.core.frame.DataFrame'>"):
             if self.keep_index:
                 index_value = X.index.values
                 index_name = X.index.name
                 column_name = list(X.columns)
-            X = X.as_matrix()
+            X = X.values
 
         assert str(type(X)).endswith("'numpy.ndarray'>"), "Unknown instance type: " + str(type(X))
         assert len(X.shape) == 1 or len(X.shape) == 2, "Instance must have 1 or 2 dimensions!"
@@ -113,7 +193,7 @@ class KernelExplainer:
         # explain the whole dataset
         elif len(X.shape) == 2:
             explanations = []
-            for i in tqdm(range(X.shape[0])):
+            for i in tqdm(range(X.shape[0]), disable=kwargs.get("silent", False)):
                 data = X[i:i + 1, :]
                 if self.keep_index:
                     data = convert_to_instance_with_index(data, column_name, index_value[i:i + 1], index_name)
@@ -148,29 +228,17 @@ class KernelExplainer:
         self.varyingFeatureGroups = [self.data.groups[i] for i in self.varyingInds]
         self.M = len(self.varyingFeatureGroups)
 
-        # find f(x) and E_x[f(x)]
+        # find f(x)
         if self.keep_index:
             model_out = self.model.f(instance.convert_to_df())
-            model_null = self.model.f(self.data.convert_to_df())
         else:
             model_out = self.model.f(instance.x)
-            model_null = self.model.f(self.data.data)
-
         if isinstance(model_out, (pd.DataFrame, pd.Series)):
-            model_out = model_out.as_matrix()[0]
-            model_null = model_null.as_matrix()
-
+            model_out = model_out.values[0]
         self.fx = model_out[0]
-        self.fnull = np.sum((model_null.T * self.data.weights).T, 0)
 
-        self.vector_out = True
-        if len(model_out.shape) == 1:
-            self.vector_out = False
-            self.D = 1
+        if not self.vector_out:
             self.fx = np.array([self.fx])
-            self.fnull = np.array([self.fnull])
-        else:
-            self.D = model_out.shape[1]
 
         # if no features vary then there no feature has an effect
         if self.M == 0:
@@ -190,8 +258,8 @@ class KernelExplainer:
             self.l1_reg = kwargs.get("l1_reg", "auto")
 
             # pick a reasonable number of samples if the user didn't specify how many they wanted
-            self.nsamples = kwargs.get("nsamples", 0)
-            if self.nsamples == 0:
+            self.nsamples = kwargs.get("nsamples", "auto")
+            if self.nsamples == "auto":
                 self.nsamples = 2 * self.M + 2**11
 
             # if we have enough samples to enumerate all subsets then ignore the unneeded samples
@@ -353,7 +421,7 @@ class KernelExplainer:
             data = pd.concat([index, data], axis=1).set_index(self.data.index_name)
         modelOut = self.model.f(data)
         if isinstance(modelOut, (pd.DataFrame, pd.Series)):
-            modelOut = modelOut.as_matrix()
+            modelOut = modelOut.values
         # if len(modelOut.shape) > 1:
         #     raise ValueError("The supplied model function should output a vector not a matrix!")
         self.y[self.nsamplesRun * self.N:self.nsamplesAdded * self.N, :] = np.reshape(modelOut, (num_to_run, self.D))
